@@ -1,0 +1,1385 @@
+---
+title: "Modelos de predicción de default bancario"
+subtitle: "Realizado por:
+•⁠  ⁠Eva Meneses Soto
+•⁠  ⁠Ana María Quintero Estévez
+•⁠  ⁠Regina Meiners de Alba"
+format:
+  revealjs:
+    self-contained: true
+editor: visual
+---
+
+El modelo óptimo, echo=TRUE
+
+```{r #Librerías}
+#Cargamos las librerías:
+library(tidymodels) #Para preprocesamiento, splitting de datos
+#library(gridExtra) # Para arreglos de gráficos
+library(readr) #Paquete para poder leer el csv
+#library(base) #Paquete para tomar unicamente valores numericos
+#library(ggplot2) #Paquete para crear los gráficos
+#library(dbplyr) #Paquete para crear los gráficos
+#library(reshape2) #Paquete utilizado para hacer la matriz de correlación
+library(glmnet) #Paquete modelos lineales penalizados
+library(parsnip) #Paquete para identificar el tipo de modelo
+library(kknn) #Paquete para modelo knn
+install.packages("randomForest")
+suppressPackageStartupMessages(library(baguette)) #Paquete para bagging
+suppressPackageStartupMessages(library(doParallel)) #Paquete para hacer el parallel
+tidymodels_prefer() # Para priorizar el paquete de tidymodels
+library(fastshap) #Para utilizar SHAP
+library(dplyr) #Para filtrar, resumir y transformar datos
+library(ggplot2) #Para gráficos
+library(tidyr) #Para pivotear tabla
+library(tibble) #Establecer como tibble
+library(viridis) #Paleta de color
+```
+
+## 1. Cargamos los datos
+
+```{r #Carga del dataset, echo=TRUE, results='markup'}
+loan_data <- read_delim("loan_data_limpio.csv", delim=",") #Cargamos los datos
+dim(loan_data) #Dimension de la base
+#Observamos los tipos de dato
+data.frame(Columna = names(loan_data), Tipo = sapply(loan_data, class))
+```
+
+## 2. Recodificación de variables
+
+```{r #Convertir tipo de variables, echo=TRUE, results='markup'}
+# Convertir variables categóricas a factor
+loan_data$home_ownership <- as.factor(loan_data$home_ownership)
+loan_data$loan_intent <- as.factor(loan_data$loan_intent)
+
+# Convertir loan_grade en factor ordenado (A > B > C > D > E)
+loan_data$loan_grade <- factor(loan_data$loan_grade,
+                               levels = c("A", "B", "C", "D", "E"),
+                               ordered = TRUE)
+
+# employment_duration se mantiene numérica (ya lo validamos)
+
+# Convertir lógicas a factores (binarias)
+loan_data$Current_loan_status <- factor(loan_data$Current_loan_status, levels = c("FALSE", "TRUE"))
+
+# Convertir a factor (orden no importa a menos que sea ordinal)
+loan_data$historical_default <- factor(loan_data$historical_default,
+                                           levels = c("False", "True", "No Register"))
+
+# Confirmar estructura final (opcional)
+str(loan_data)
+dim(loan_data)
+```
+
+## 3. Splitting
+
+```{r #Splitting, echo=TRUE}
+set.seed(123) 
+loan_split <- rsample::initial_split(loan_data, prop = 0.7, strata = Current_loan_status)
+loan_train <- rsample::training(loan_split)
+loan_test <- rsample::testing(loan_split)
+```
+
+```{r #Splitting info, results = 'asis'}
+cat("<p style='font-size:22px;'>El splitting que realizamos fue:
+Estratificado. Se utiliza una estratificación basada en los valores de la variable target. Como la variable target es un factor cualitativo se asegura que la proporción de cada grupo se mantenga en training y test.</p>")
+```
+
+## 4. Establecimiento de recetas de preprocesamiento
+
+1.  Se excluyen features con varainza casi nula.
+
+2.  Se imputaron los valores faltantes de loan_int_rate usando la mediana dentro de cada loan_grade. Dado que la variable presenta asimetría y outliers en su distribución, la mediana proporciona una medida robusta del centro, evitando el sesgo que podría introducirse al usar la media. Esto lo consideramos adecuado dada la relaicón observada en el apartado del EDA que vimos entre estas dos variables. Evitás data leakage (usar info del test en train) al hacer la imputación solo sobre datos de entrenamiento.
+
+    ------------------------------------------------------------------------
+
+3.  Otorgamos un número a cada nivel de las variables ordinales.
+
+4.  Creamos dummies para las variables nominales.
+
+5.  Nuevamente se excluyen features con varainza casi nula en caso de que exista alguna en las variables dummies creadas.
+
+6.  Se realiza la transformación Yeo Johnson a los features numéricos, se utiliza en lugar de Box Cox al contar con variables con valores cero.
+
+7.  Se normalizan los datos numércios dado que estos están en distintas unidades.
+
+------------------------------------------------------------------------
+
+### Receta
+
+```{r #Tabla medianas loan grade, echo=TRUE}
+#Hacemos una tabla con las medianas por calificación de crédito:
+loan_medians <- loan_train %>%
+  group_by(loan_grade) %>%
+  summarise(loan_int_rate_group_median = median(loan_int_rate, na.rm = TRUE))
+
+#Hacemos un left join de esta tabla a los datos de train y test tomando la información de train también para el test para evitar data leakage.
+loan_train <- left_join(loan_train, loan_medians, by = "loan_grade")
+loan_test  <- left_join(loan_test,  loan_medians, by = "loan_grade")
+```
+
+```{r #Receta, echo=TRUE}
+  
+rec1_loan <- recipe( Current_loan_status ~ . , 
+                    data = loan_train) |>
+  # Eliminar manualmente la variable antes de cualquier paso
+  step_rm(historical_default) |>
+  # Excluye features con varianza casi nula
+  step_nzv(all_predictors()) |>
+  #Imputamos las tasas utilizando la mediana de cada calificacion de credito
+  step_mutate(loan_int_rate = ifelse(is.na(loan_int_rate),
+                                     loan_int_rate_group_median,
+                                     loan_int_rate)) |>
+  step_rm(loan_int_rate_group_median) |>
+  #Les otorga un número (1,2,3,4..) a cada nivel de las variables ordinales 
+  step_ordinalscore(all_ordered_predictors()) |>
+  #Creamos las variables dummy
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) |>
+  #Se eliminan las features con varianza casi nula en caso de que hubiera alguna dummy.
+  step_nzv(all_predictors()) |>
+  #Se realiza la transformación Yeo Johnson a los features numericos
+  step_YeoJohnson(all_numeric_predictors()) |>
+  #Se normalizan los datos numércios dado que estos están en distintas unidades.
+  step_normalize(all_numeric_predictors()) 
+```
+
+------------------------------------------------------------------------
+
+## 5. Creación de los algoritmos, modelos lineales penalizados.
+
+```{r #Validación cruzada, echo=TRUE}
+#Creamos los conjuntos para validación cruzada.
+set.seed(101112)
+k1 <- 5; k2 <- 2
+loan_cvrep <- rsample::vfold_cv(loan_train, v = k1, 
+                                repeats = k2,
+                                strata = "Current_loan_status")
+
+# Creamos la lista de métricas a evaluar
+metricas <- metric_set(accuracy, sens, precision, spec, roc_auc, f_meas, detection_prevalence)
+ctrla <- control_resamples(event_level = 'second')
+ctrlt <- control_grid(event_level ='second')
+ctrlf <- control_last_fit(event_level = 'second')
+```
+
+```{r #Métricas definidas, results = 'asis'}
+  
+cat("<p style='font-size:22px;'>Acuracidad y especificidad destacan en tablas de confusión, enfocándose en clasificaciones correctas.</p>")
+cat("<p style='font-size:22px;'>Precisión y Sensitivity abordan aspectos más específicos del manejo de falsos positivos y negativos.</p>")
+cat("<p style='font-size:22px;'>F1-Measure resulta útil en datasets desbalanceados, como se indica en la teoría.</p>")
+cat("<p style='font-size:22px;'>ROC AUC permite evaluar globalmente la discriminación del modelo, siendo ideal para comparar diferentes algoritmos.</p>")
+
+```
+
+## 5.1 Ridge
+
+```{r #Ridge: Workflow, echo=TRUE}
+# Hacemos el modelo Ridge con mixture = 0 (especificando que es Ridge) y 
+# establecemos que el parámetro lambda es el que se va a tunear.
+ridge_model_tune <- logistic_reg(penalty = tune(), mixture = 0) |>
+ set_engine("glmnet")
+
+# Creamos el workflow con el modelo y la receta creada.
+wflow_ridge_tune <- workflow() |>
+ add_model(ridge_model_tune) |>
+  add_recipe(rec1_loan)
+
+# Extrae los hiperparámetros de dicho workflow.
+wflow_ridge_tune_param <- extract_parameter_set_dials(wflow_ridge_tune)
+
+# Establecemos el grid.
+grid_ridge_tune <- grid_max_entropy(wflow_ridge_tune_param, size = 100)
+grid_ridge_tune
+```
+
+------------------------------------------------------------------------
+
+### Ridge: Tunning
+
+```{r #Ridge: Tuneo, echo=TRUE}
+# Realizamos el tuneo con validación cruzada
+ridge_reg_tune <- tune_grid(wflow_ridge_tune, 
+                            loan_cvrep, 
+                            grid = grid_ridge_tune, 
+                            metrics = metricas,
+                            control= ctrlt)
+
+# Recolectamos las métricas del tuneo
+ridge_reg_tune |>
+ collect_metrics()
+```
+
+------------------------------------------------------------------------
+
+### Ridge: roc_auc & f_meas
+
+```{r #Ridge: Best roc/f_meas, echo=TRUE}
+# Mostramos los mejores resultados según la métrica roc_auc
+ridge_reg_tune |>
+ show_best(metric = "roc_auc")
+
+# Mostramos los mejores resultados según la métrica f_meas
+ridge_reg_tune |>
+ show_best(metric = "f_meas")
+```
+
+------------------------------------------------------------------------
+
+### Ridge: Penalización
+
+```{r #Ridge: Penalización1, echo=TRUE}
+# Seleccionamos el mejor valor para el penalty utilizando f_meas como métrica
+# de evaluación, el cual coincide con el roc_auc
+best_ridge_reg_tune <- ridge_reg_tune |>
+  select_best(metric = "f_meas")
+
+# Finalizamos el workflow con el mejor valor del parámetro encontrado
+finalwf_ridge <- wflow_ridge_tune |>
+  finalize_workflow(best_ridge_reg_tune)
+finalwf_ridge
+```
+
+------------------------------------------------------------------------
+
+### Ridge: Penalización
+
+```{r #Ridge: Penalización2, echo=TRUE}
+# Filtramos las métricas para obtener los resultados del mejor penalty encontrado
+ridge_reg_tune |>
+  collect_metrics() |>
+  dplyr::filter(penalty == best_ridge_reg_tune$penalty)
+```
+
+## 5.2 Lasso
+
+```{r #Lasso: Workflow, echo=TRUE}
+# Hacemos el modelo Lasso con mixture=1 (especificando que es Lasso) y 
+# establecemos que el parámetro lambda es el que se va a tunear.
+lasso_model_tune <- logistic_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+
+# Creamos el workflow con el modelo y la receta creada.
+wflow_lasso_tune <-  workflow() |>
+  add_model(lasso_model_tune) |>
+  add_recipe(rec1_loan)
+
+# Extrae los hiperparámetros de dicho workflow.
+wflow_lasso_tune_param <- extract_parameter_set_dials(wflow_lasso_tune)
+
+# Establecemos el grid.
+grid_lasso_tune <- grid_max_entropy(wflow_lasso_tune_param, size = 100)
+grid_lasso_tune
+```
+
+------------------------------------------------------------------------
+
+### Lasso: Tunning
+
+```{r #Lasso: Tuneo, echo=TRUE}
+# Realizamos el tuneo con validación cruzada
+lasso_reg_tune <- tune_grid(wflow_lasso_tune, 
+                            loan_cvrep, 
+                            grid = grid_lasso_tune, 
+                            metrics = metricas,
+                            control=ctrlt)
+
+# Recolectamos las métricas del tuneo
+lasso_reg_tune |>
+  collect_metrics()
+```
+
+------------------------------------------------------------------------
+
+### Lasso: roc_auc & f_meas
+
+```{r #Lasso: Best roc/f_meas, echo=TRUE}
+# Mostramos los mejores resultados según la métrica roc_auc
+lasso_reg_tune |>
+  show_best(metric = "roc_auc")
+
+# Mostramos los mejores resultados según la métrica f_meas
+lasso_reg_tune |>
+  show_best(metric = "f_meas")
+```
+
+------------------------------------------------------------------------
+
+### Lasso: Penalización
+
+```{r #Lasso: Penalización1, echo=TRUE}
+# Selecionamos el mejor valor para el penalty con f_meas dado que implica más costo en este caso no identificar de manera adecuada un evento positivo, es decir, default bancario.
+best_lasso_reg_tune <- lasso_reg_tune |>
+  select_best(metric = "f_meas")
+
+# Finalizamos el workflow con el mejor valor del parámetro encontrado
+finalwf_lasso <- wflow_lasso_tune |>
+  finalize_workflow(best_lasso_reg_tune)
+finalwf_lasso
+```
+
+------------------------------------------------------------------------
+
+### Lasso: Penalización
+
+```{r #Lasso: Penalización2, echo=TRUE}
+# Filtramos las métricas para obtener los resultados del mejor penalty encontrado
+lasso_reg_tune |>
+  collect_metrics() |>
+  dplyr::filter(penalty == best_lasso_reg_tune$penalty)
+```
+
+## 5.3 Elastic Net
+
+```{r #Elastic Net: Workflow, echo=TRUE}
+# En primer lugar, definimos el modelo que es una mezcla del Modelo Ridge 
+# (mixure = 0) y el Modelo Lasso (mixure = 1) por lo que ponemos 
+# mixure = tune() que indica que es una mezcla de ambos y se tunea de igual 
+# manera este parametro.
+elnet_model_tune <- logistic_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet")
+
+#Creamos el workflow con el modelo y la receta creada.
+wflow_elnet_tune <-  workflow() |>
+  add_model(elnet_model_tune) |>
+  add_recipe(rec1_loan)
+
+# Extrae los hiperparámetros de dicho workflow.
+wflow_elnet_tune_param <- extract_parameter_set_dials(wflow_elnet_tune)
+
+#Establecemos el grid.
+grid_elnet_tune <- grid_max_entropy(wflow_elnet_tune_param, size = 300)
+grid_elnet_tune
+```
+
+------------------------------------------------------------------------
+
+### Elastic Net: Tunning
+
+```{r #Elastic Net: Tuneo, echo=TRUE}
+# Realizamos el tuneo con validación cruzada
+elnet_reg_tune <- tune_grid(wflow_elnet_tune, 
+                            loan_cvrep, 
+                            grid = grid_elnet_tune, 
+                            metrics = metricas,
+                            control = ctrlt)
+# Recolectamos las métricas del tuneo
+elnet_reg_tune |>
+  collect_metrics()
+```
+
+------------------------------------------------------------------------
+
+### Elastic Net: roc_auc & f_meas
+
+```{r #Elastic Net: Best roc/f_meas, echo=TRUE}
+# Mostramos los mejores resultados según la métrica roc_auc
+elnet_reg_tune |>
+  show_best(metric = "roc_auc")
+
+# Mostramos los mejores resultados según la métrica f_meas
+elnet_reg_tune |>
+  show_best(metric = "f_meas")
+```
+
+------------------------------------------------------------------------
+
+### Elastic Net: Penalización
+
+```{r #Elastic Net: Penalización1, echo=TRUE}
+#Selecionamos el mejor valor para el penalty utilizando f_meas.
+best_elnet_reg_tune <- elnet_reg_tune |>
+  select_best(metric = "f_meas")
+
+# Finalizamos el workflow con el mejor valor del parámetro encontrado
+finalwf_elnet <- wflow_elnet_tune |>
+  finalize_workflow(best_elnet_reg_tune)
+finalwf_elnet
+```
+
+------------------------------------------------------------------------
+
+### Elastic Net: Penalización
+
+```{r #Elastic Net: Penalización2, echo=TRUE}
+# Filtramos las métricas para obtener los resultados del mejor penalty encontrado
+elnet_reg_tune |>
+  collect_metrics() |>
+  dplyr::filter(penalty == best_elnet_reg_tune$penalty, mixture ==
+                  best_elnet_reg_tune$mixture)
+```
+
+## 6. Nuevo assessment con validación cruzada
+
+```{r #Nueva validación cruzada, echo=TRUE}
+#Creamos otros conjuntos para validación cruzada.
+set.seed(123)
+k1 <- 5; k2 <- 2
+loan_cvrep2 <- rsample::vfold_cv(loan_train, v = k1, 
+                                 repeats = k2,
+                                 strata = "Current_loan_status")
+```
+
+------------------------------------------------------------------------
+
+### Assessment con Ridge
+
+```{r #Assessment con Ridge, echo=TRUE}
+# Assessment con un nuevo conjunto de datos Ridge:
+asses_finalwf_ridge <- fit_resamples(finalwf_ridge, 
+                                     resamples = loan_cvrep2, 
+                                     metrics = metricas,
+                                     control = ctrla)
+
+# Recolectamos las métricas obtenidas
+ridge_metrics <- collect_metrics(asses_finalwf_ridge)
+collect_metrics(asses_finalwf_ridge)
+
+# Observamos métricas similares a las obtenidas con el otro CV.
+```
+
+------------------------------------------------------------------------
+
+### Assessment con Lasso
+
+```{r #Assessment con Lasso, echo=TRUE}
+# Assessment con un nuevo conjunto de datos Lasso:
+asses_finalwf_lasso <- fit_resamples(finalwf_lasso, 
+                                     resamples = loan_cvrep2 , 
+                                     metrics = metricas,
+                                     control = ctrla)
+# Recolectamos las métricas obtenidas
+lasso_metrics <- collect_metrics(asses_finalwf_lasso)
+collect_metrics(asses_finalwf_lasso)
+
+#Observamos metricas similares a las obtenidas con el otro cv.
+```
+
+------------------------------------------------------------------------
+
+### Assessment con Elastic Net
+
+```{r #Assessment con Elastic net, echo=TRUE}
+#Assessment con un nuevo conjunto de datos Elastic Net:
+asses_finalwf_elnet <- fit_resamples(finalwf_elnet, 
+                                     resamples = loan_cvrep2 , 
+                                     metrics = metricas,
+                                     control = ctrla)
+# Recolectamos las métricas obtenidas
+elnet_metrics <- collect_metrics(asses_finalwf_elnet)
+collect_metrics(asses_finalwf_elnet)
+
+#Observamos metricas similares a las obtenidas con el otro cv.
+```
+
+------------------------------------------------------------------------
+
+### Comparación de métricas modelos lineales
+
+```{r #Assessment modelos lineales, echo=FALSE, results="hide"}
+# Comparar métricas en tablas
+ridge_metrics |> mutate(Model = "Ridge")
+lasso_metrics |> mutate(Model = "Lasso")
+elnet_metrics |> mutate(Model = "Elastic-Net")
+```
+
+```{r #Assessment Modelos Lineales, echo=TRUE}
+# Combinar resultados en una sola tabla para facilitar la comparación
+a <- bind_rows(
+  ridge_metrics |> mutate(Model = "Ridge"),
+  lasso_metrics |> mutate(Model = "Lasso"),
+  elnet_metrics |> mutate(Model = "Elastic-Net")
+) |> 
+  arrange(desc(.metric), Model)
+print(n=22,a)
+
+#Podemos observar que el modelo que obtiene mejores resultados de los modelos lineales es el modelo Lasso.
+
+```
+
+## 7. Creación de los algoritmos, modelos no lineales.
+
+## 7.1 Vecinos cercanos (KNN)
+
+## KNN: Workflow
+
+```{r #KNN: Workflow, echo=TRUE}
+#Definimos el modelo y los parámetros a tunear:
+knn_model_tune <-
+  nearest_neighbor(neighbors = tune(),
+                   dist_power = tune()) |>
+  set_engine("kknn") |>
+  set_mode("classification")
+  
+#Creamos el workflow con el modelo y la receta creada.
+wflow_knn_tune <-  workflow() |>
+  add_model(knn_model_tune) |>
+  add_recipe(rec1_loan)
+
+# Extrae los hiperparámetros de dicho workflow.
+wflow_knn_tune_param  <- extract_parameter_set_dials(wflow_knn_tune)
+
+# Extrae los hiperparámetros de dicho workflow.
+grid_knn_tune <- tibble(expand.grid(neighbors = c(9,10,11,12,13,14),
+                                    dist_power = c(1,2)))
+grid_knn_tune
+```
+
+------------------------------------------------------------------------
+
+## KNN: Tunning
+
+```{r #KNN: Tunning, echo=TRUE}
+
+# Realizamos el tuneo con validación cruzada
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+knn_reg_tune <- tune_grid(wflow_knn_tune,
+                          loan_cvrep,
+                          grid = grid_knn_tune,
+                          metrics = metricas,
+                          control = ctrlt)
+stopCluster(cl)
+
+# Recolectamos las métricas del tuneo
+knn_reg_tune |>
+  collect_metrics()
+```
+
+------------------------------------------------------------------------
+
+## KNN: roc_auc & f_meas
+
+```{r #KNN: Best roc/f_meas, echo=TRUE}
+# Mostramos los mejores resultados según la métrica roc_auc
+knn_reg_tune |>
+  show_best(metric = "roc_auc")
+
+# Mostramos los mejores resultados según la métrica f_meas
+knn_reg_tune |>
+  show_best(metric = "f_meas")
+```
+
+------------------------------------------------------------------------
+
+### KNN: Selección parámetros
+
+```{r #KNN: Parametros, echo=TRUE}
+#Selecionamos el mejor valor para el número de vecindarios y dist_power.
+best_knn_reg_tune <- knn_reg_tune |>
+                         select_best(metric = "f_meas")
+
+# Finalizamos el workflow con el mejor valor del parámetro encontrado
+finalwf_knn <- wflow_knn_tune |>
+                           finalize_workflow(best_knn_reg_tune)
+finalwf_knn
+```
+
+------------------------------------------------------------------------
+
+### Assessment con KNN
+
+```{r #KNN: Assessment, echo=TRUE}
+#Assessment con un nuevo conjunto de datos KNN:
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+asses_finalwf_knn <-
+  fit_resamples(finalwf_knn,
+                resamples = loan_cvrep2,
+                metrics = metricas,
+                control = ctrla)
+stopCluster(cl)
+
+# Recolectamos las métricas obtenidas
+collect_metrics(asses_finalwf_knn)
+knn_metrics <- collect_metrics(asses_finalwf_knn)
+```
+
+------------------------------------------------------------------------
+
+## 7.2 Bagging
+
+```{r #Bagging: Receta, echo=TRUE}
+#Se realiza la receta para bagging:
+
+rec_bag <- recipe(Current_loan_status ~ ., data = loan_train) |>
+  # Eliminar explícitamente la variable conflictiva
+  step_rm(historical_default) |>
+  
+  # Imputar las tasas utilizando la mediana por calificación crediticia
+  step_mutate(loan_int_rate = ifelse(
+    is.na(loan_int_rate),
+    loan_int_rate_group_median,
+    loan_int_rate)) |>
+  step_rm(loan_int_rate_group_median)
+```
+
+------------------------------------------------------------------------
+
+## Bagging: Workflow
+
+```{r #Bagging: Workflow, echo=TRUE}
+#Definimos el modelo y los parámetros a tunear:
+bag_model_tune <- bag_tree(tree_depth = tune(), min_n = tune(), 
+                           cost_complexity = tune()) |> 
+  set_engine("rpart") |> 
+  set_mode("classification")
+
+#Creamos el workflow con el modelo y la receta creada.
+wflow_bag_tune <-  workflow() |>
+  add_model(bag_model_tune) |>
+  add_recipe(rec_bag)
+
+# Extrae los hiperparámetros de dicho workflow.
+wflow_bag_tune_param  <- extract_parameter_set_dials(wflow_bag_tune)
+
+#Establecemos el grid.
+grid_bag_tune <- expand.grid(
+           cost_complexity = penalty() |> 
+                             range_set(c(-10, -1)) |>
+                             value_seq(n = 10, original = TRUE),
+           tree_depth = c(10, 15, 20, 25),
+           min_n = c(5, 10, 15))
+
+grid_bag_tune
+```
+
+------------------------------------------------------------------------
+
+## Bagging: Tunning
+
+```{r #Bagging: Tunning, echo=TRUE}
+# Realizamos el tuneo con validación cruzada
+
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+
+bag_reg_tune <- tune_grid(wflow_bag_tune,
+                          loan_cvrep,
+                          grid = grid_bag_tune,
+                          metrics = metricas,
+                          control = ctrlt)
+stopCluster(cl)
+
+# Recolectamos las métricas del tuneo
+bag_reg_tune |>
+  collect_metrics()
+```
+
+------------------------------------------------------------------------
+
+### Bagging: roc_auc & f_meas
+
+```{r #Bagging: Best roc/f_meas, echo=TRUE}
+# Mostramos los mejores resultados según la métrica roc_auc
+bag_reg_tune |>
+  show_best(metric = "roc_auc")
+
+# Mostramos los mejores resultados según la métrica f_meas
+bag_reg_tune |>
+  show_best(metric = "f_meas")
+```
+
+------------------------------------------------------------------------
+
+### Bagging: Selección parámetros
+
+```{r #Bagging: Parametros, echo=TRUE}
+#Selecionamos el mejor valor para el número de tree_depth, min_n y cost_complexity:
+best_bag_reg_tune <- bag_reg_tune |>
+                         select_best(metric = "f_meas") 
+
+# Finalizamos el workflow con el mejor valor del parámetro encontrado
+finalwf_bag <- wflow_bag_tune |>
+                           finalize_workflow(best_bag_reg_tune)
+finalwf_bag
+```
+
+------------------------------------------------------------------------
+
+### Assessment con Bagging
+
+```{r #Bagging: Assessment, echo=TRUE}
+#Assessment con un nuevo conjunto de datos Bagging:
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+
+asses_finalwf_bag <-
+  fit_resamples(finalwf_bag,
+                resamples = loan_cvrep2,
+                metrics = metricas,
+                control = ctrla)
+stopCluster(cl)
+# Recolectamos las métricas obtenidas
+collect_metrics(asses_finalwf_bag)
+bag_metrics <- collect_metrics(asses_finalwf_bag)
+```
+
+## 7.3 SVM
+
+```{r #SVM: Workflow, echo=TRUE}
+
+#Definimos el modelo y los parámetros a tunear:
+svmrb_model_tune <- svm_rbf(cost = tune(), rbf_sigma = tune()) |> 
+  set_engine("kernlab")  |>
+  set_mode("classification")
+
+#Creamos el workflow con el modelo y la receta creada.
+svmrb_wf_tune <- workflow() |> add_recipe(rec1_loan) |> 
+  add_model(svmrb_model_tune)
+
+# Extrae los hiperparámetros de dicho workflow.
+svmrb_wf_tune_param  <- extract_parameter_set_dials(svmrb_wf_tune)
+
+#Establecemos el grid.
+grid_svmrb_wf_tune <- expand.grid(cost = cost() |> 
+                      value_seq(n = 10, original = TRUE), 
+                      rbf_sigma = rbf_sigma() |> 
+                        value_seq(n = 10, original = TRUE))
+```
+
+------------------------------------------------------------------------
+
+### SVM: Tunning
+
+```{r #SVM: Tuneo, echo=TRUE}
+# Realizamos el tuneo con validación cruzada
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+svmrb_reg_tune <- tune_grid(svmrb_wf_tune,
+                          loan_cvrep,
+                          grid = grid_svmrb_wf_tune,
+                          metrics = metricas, 
+                          control = ctrlt)
+stopCluster(cl)
+
+# Recolectamos las métricas del tuneo
+svmrb_reg_tune |>
+  collect_metrics()
+```
+
+------------------------------------------------------------------------
+
+### SVM: roc_auc & f_meas
+
+```{r #SVM: Best roc/f_meas, echo=TRUE}
+# Mostramos los mejores resultados según la métrica roc_auc
+svmrb_reg_tune |>
+  show_best(metric = "roc_auc")
+
+# Mostramos los mejores resultados según la métrica f_meas
+svmrb_reg_tune |>
+  show_best(metric = "f_meas")
+
+```
+
+------------------------------------------------------------------------
+
+### SVM: Selección parámetros
+
+```{r #SVM: Penalización1, echo=TRUE}
+# Selecionamos el mejor valor para el penalty con f_meas dado que implica más costo en este caso no identificar de manera adecuada un evento positivo, es decir, default bancario.
+best_svmrb_reg_tune <- svmrb_reg_tune |>
+                         select_best(metric = "f_meas")
+
+# Finalizamos el workflow con el mejor valor del parámetro encontrado
+finalwf_svmrb <- svmrb_wf_tune |>
+                           finalize_workflow(best_svmrb_reg_tune)
+finalwf_svmrb
+```
+
+------------------------------------------------------------------------
+
+### SVM: Assessment
+
+```{r #SVM: Penalización2, echo=TRUE}
+#Assessment con un nuevo conjunto de datos:
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+asses_finalwf_svmrb <-
+  fit_resamples(finalwf_svmrb,
+                resamples = loan_cvrep2,
+                metrics = metricas,
+                control = ctrla)
+stopCluster(cl)
+collect_metrics(asses_finalwf_svmrb)
+svm_metrics <- collect_metrics(asses_finalwf_svmrb)
+```
+
+------------------------------------------------------------------------
+
+## 7.4 Random Forest
+
+```{r #Random Forest: Receta, echo=TRUE}
+#Se realiza la receta para random forest:
+
+rec_rf <- recipe(Current_loan_status ~ . , 
+                    data = loan_train) |>
+  # Eliminar explícitamente la variable conflictiva
+  step_rm(historical_default) |>
+  # Excluye features con varianza casi nula
+  step_nzv(all_predictors()) |>
+  #Imputamos las tasas utilizando la mediana de cada calificacion de credito
+  step_mutate(loan_int_rate = ifelse(is.na(loan_int_rate),
+                                     loan_int_rate_group_median,
+                                     loan_int_rate)) |>
+  step_rm(loan_int_rate_group_median)
+
+```
+
+------------------------------------------------------------------------
+
+### Random Forest Workflow
+
+```{r #Random Forest: Workflow, echo=TRUE}
+  
+#Definimos el modelo y los parámetros a tunear:
+rf_model_tune <- rand_forest(mtry = tune(), trees = tune(), 
+                             min_n = tune()) |> 
+  set_engine("randomForest") |> 
+  set_mode("classification")
+
+#Creamos el workflow con el modelo y la receta creada. Utilizamos la misma que Bagging porque se requiere el mismo preprocesamiento.
+wflow_rf_tune <-  workflow() |>
+  add_model(rf_model_tune) |>
+  add_recipe(rec_rf)
+
+# Extrae los hiperparámetros de dicho workflow.
+wflow_rf_tune_param  <- extract_parameter_set_dials(wflow_rf_tune)
+
+#Establecemos el grid.
+grid_rf_tune <- expand.grid(mtry = c(5, 10, 15, 25),
+                      trees = c(500, 1000),
+                      min_n = c(10, 50))
+```
+
+------------------------------------------------------------------------
+
+### Random Forest: Tunning
+
+```{r #Random Forest: Tuneo, echo=TRUE}
+# Realizamos el tuneo con validación cruzada
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+rf_reg_tune <- tune_grid(wflow_rf_tune,
+                          loan_cvrep,
+                          grid = grid_rf_tune,
+                          metrics = metricas)
+stopCluster(cl)
+
+# Recolectamos las métricas del tuneo
+rf_reg_tune |>
+  collect_metrics()
+```
+
+------------------------------------------------------------------------
+
+### Random Forest: roc_auc & f_meas
+
+```{r #Random Forest: Best roc/f_meas, echo=TRUE}
+# Mostramos los mejores resultados según la métrica roc_auc
+rf_reg_tune |>
+  show_best(metric = "roc_auc")
+
+# Mostramos los mejores resultados según la métrica f_meas
+rf_reg_tune |>
+  show_best(metric = "f_meas")
+
+```
+
+------------------------------------------------------------------------
+
+### Random Forest: Selección parámetros
+
+```{r #Random Forest: Penalización1, echo=TRUE}
+# Selecionamos el mejor valor para el penalty con f_meas dado que implica más costo en este caso no identificar de manera adecuada un evento positivo, es decir, default bancario.
+best_rf_reg_tune <- rf_reg_tune |>
+                         select_best(metric = "f_meas")
+
+# Finalizamos el workflow con el mejor valor del parámetro encontrado
+finalwf_rf <- wflow_rf_tune |>
+                           finalize_workflow(best_rf_reg_tune)
+finalwf_rf
+```
+
+------------------------------------------------------------------------
+
+### Random Forest: Assessment
+
+```{r #Random Forest: Penalización2, echo=TRUE}
+# Paso 1: Paralelización
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+
+# Paso 2: Ejecución con clúster
+asses_finalwf_rf <- fit_resamples(
+  finalwf_rf,
+  resamples = loan_cvrep2,
+  metrics = metricas,
+  control = ctrla
+)
+
+# Paso 3: Cerrar clúster
+stopCluster(cl)
+registerDoSEQ()
+
+# Paso 4: Mostrar resultados en consola (modo secuencial)
+print("Resumen de métricas del modelo Random Forest:")
+rf_metrics <- collect_metrics(asses_finalwf_rf)
+print(rf_metrics)
+```
+
+------------------------------------------------------------------------
+
+## 7.5 MARS
+
+```{r #MARS: Receta, echo=TRUE}
+  
+#Se realiza la receta para MARS:
+rec_mars <- recipe(Current_loan_status ~ . , 
+                    data = loan_train) |>
+  # Eliminar explícitamente la variable conflictiva
+  step_rm(historical_default) |>
+  # Imputamos los datos faltantes de la variable de la tasa de interés:
+  step_mutate(loan_int_rate = ifelse(is.na(loan_int_rate),
+                                     loan_int_rate_group_median,
+                                     loan_int_rate)) |>
+  step_rm(loan_int_rate_group_median) |>
+  #Les otorga un número (1,2,3,4..) a cada nivel de las variables ordinales: 
+  step_ordinalscore(all_ordered_predictors()) |>
+  #Creamos las variables dummy:
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) |>
+  #Se realiza la transformación Yeo Johnson a los features numericos:
+  step_YeoJohnson(all_numeric_predictors())
+  
+
+```
+
+------------------------------------------------------------------------
+
+### MARS: Workflow
+
+```{r #MARS: Workflow, echo=TRUE}
+#Definimos el modelo y los parámetros a tunear:
+mars_tune <- mars(num_terms = tune(), prod_degree = tune()) |> 
+  set_engine("earth") |> 
+  set_mode("classification")
+
+#Creamos el workflow con el modelo y la receta creada.
+wflow_mars_tune <-  workflow() |>
+  add_model(mars_tune) |>
+  add_recipe(rec_mars)
+
+# Extrae los hiperparámetros de dicho workflow.
+wflow_mars_tune_param  <- extract_parameter_set_dials(wflow_mars_tune)
+
+#Establecemos el grid.
+grid1_mars <- expand.grid(num_terms = num_terms() |>
+                            range_set(c(10, 80)) |>
+                            value_seq(n=15),
+              prod_degree = c(1, 2, 3))
+```
+
+------------------------------------------------------------------------
+
+### MARS: Tunning
+
+```{r #MARS: Tuneo, echo=TRUE}
+# Realizamos el tuneo con validación cruzada
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+mars_reg_tune <- tune_grid(wflow_mars_tune,
+                          loan_cvrep,
+                          grid = grid1_mars,
+                          metrics = metricas,
+                          control = ctrlt)
+stopCluster(cl)
+
+# Recolectamos las métricas del tuneo
+mars_reg_tune |>
+  collect_metrics()
+```
+
+------------------------------------------------------------------------
+
+### MARS: roc_auc & f_meas
+
+```{r #MARS: Best roc/f_meas, echo=TRUE}
+# Mostramos los mejores resultados según la métrica roc_auc
+mars_reg_tune |>
+  show_best(metric = "roc_auc")
+
+# Mostramos los mejores resultados según la métrica f_meas
+mars_reg_tune |>
+  show_best(metric = "f_meas")
+
+```
+
+------------------------------------------------------------------------
+
+### MARS: Selección parámetros
+
+```{r #MARS: Penalización1, echo=TRUE}
+# Selecionamos el mejor valor para el penalty con f_meas dado que implica más costo en este caso no identificar de manera adecuada un evento positivo, es decir, default bancario.
+best_mars_reg_tune <- mars_reg_tune |>
+                         select_best(metric = "f_meas")
+
+# Finalizamos el workflow con el mejor valor del parámetro encontrado
+finalwf_mars <- wflow_mars_tune |>
+  finalize_workflow(best_mars_reg_tune)
+finalwf_mars
+```
+
+------------------------------------------------------------------------
+
+### MARS: Assessment
+
+```{r #MARS: Penalización2, echo=TRUE}
+#Assessment con un nuevo conjunto de datos:
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+asses_finalwf_marsrb <-
+  fit_resamples(finalwf_mars,
+                resamples = loan_cvrep2,
+                metrics = metricas,
+                control = ctrla)
+stopCluster(cl)
+collect_metrics(asses_finalwf_marsrb)
+mars_metrics <- collect_metrics(asses_finalwf_marsrb)
+```
+
+------------------------------------------------------------------------
+
+## 8. Creación de los algoritmos, modelos no lineales.
+
+## 8.1 Comparación métricas modelos no lineales
+
+```{r #Assessment modelos no lineales, echo=FALSE, results="hide"}
+
+# Comparar métricas en tablas
+knn_metrics |> mutate(Model = "KNN")
+bag_metrics |> mutate(Model = "Bagging")
+svm_metrics |> mutate(Model = "SVM")
+rf_metrics  |> mutate(Model = "Random Forest")
+mars_metrics |> mutate(Model = "MARS")
+
+
+```
+
+```{r #Assessment modelos no lineales 2, echo=TRUE}
+# Combinar resultados en una sola tabla para facilitar la comparación
+# Combinar métricas de todos los modelos y añadir columna con nombre del modelo
+metricas_modelos <- bind_rows(
+  knn_metrics  |> mutate(Model = "KNN"),
+  bag_metrics  |> mutate(Model = "Bagging"),
+  svm_metrics  |> mutate(Model = "SVM"),
+  rf_metrics   |> mutate(Model = "Random Forest"),
+  mars_metrics |> mutate(Model = "MARS")
+) |> 
+  arrange(.metric, desc(mean))  # Ordenamos primero por tipo de métrica, luego por valor
+
+# Imprimir la tabla completa
+print(metricas_modelos, n = Inf)
+
+```
+
+------------------------------------------------------------------------
+
+## 8.2 Comparación modelo no lineal seleccionado vs el lineal
+
+```{r #Comparativo lineal vs no lineal, echo=TRUE}
+# Combinar resultados en una sola tabla para facilitar la comparación
+a <- bind_rows(
+  lasso_metrics |> mutate(Model = "Lasso"),
+  rf_metrics |> mutate(Model = "Random Forest")
+) |> 
+  arrange(desc(.metric), Model)
+print(n=22,a)
+
+#Observamos que el modelo más adecuado según las métricas es el de bagging por lo que se procede a realizar un final fit con dicho modelo.
+```
+
+------------------------------------------------------------------------
+
+## 9. Selección del modelo
+
+```{r #Selección del modelo óptimo, echo=TRUE}
+# 1. Entrenar el workflow con los datos de entrenamiento
+final_fit_rf <- fit(finalwf_rf, data = loan_train)
+
+# 2. Predecir probabilidades y clases en el test
+rf_preds <- predict(final_fit_rf, new_data = loan_test, type = "prob") %>%
+  bind_cols(predict(final_fit_rf, new_data = loan_test)) %>%  # clase predicha
+  bind_cols(loan_test %>% select(Current_loan_status))         # clase real
+
+metricas <- metric_set(
+  metric_tweak("accuracy", accuracy, event_level = "second"),
+  metric_tweak("sens", sens, event_level = "second"),
+  metric_tweak("spec", spec, event_level = "second"),
+  metric_tweak("precision", precision, event_level = "second"),
+  metric_tweak("f_meas", f_meas, event_level = "second"),
+  metric_tweak("roc_auc", roc_auc, event_level = "second"),
+  metric_tweak("detection_prevalence", detection_prevalence, event_level = "second")
+)
+# 3. Calcular métricas en el conjunto de test
+metricas(rf_preds, truth = Current_loan_status, estimate = .pred_class, .pred_TRUE)
+
+
+```
+
+------------------------------------------------------------------------
+
+## Métricas finales
+
+#### Accuracy (92.8%):
+
+De todas las predicciones realizadas, el 92.8% son correctas, es decir, el modelo clasifica correctamente tanto a los clientes que harán default como a los que no lo harán.
+
+#### Sensitivity (71.3%):
+
+Si un cliente hará default, la probabilidad de que el modelo lo detecte correctamente como tal es del 71.3%.
+
+------------------------------------------------------------------------
+
+## Métricas finales
+
+#### Precision (92.4%):
+
+De los clientes que el modelo predice que harán default, la probabilidad de que realmente lo hagan es del 92.4%.
+
+#### Specificity (98.5%):
+
+Si un cliente no hará default, la probabilidad de que el modelo lo clasifique correctamente como tal es del 98.5%.
+
+------------------------------------------------------------------------
+
+## Métricas finales
+
+#### F1-Measure (80.5%):
+
+Este valor refleja el equilibrio entre sensibilidad y precisión. En promedio, el modelo maneja bien tanto la detección de clientes que harán default como evitar predicciones incorrectas.
+
+#### ROC AUC (93.5%):
+
+Si elegimos aleatoriamente a un cliente que hará default y otro que no, la probabilidad de que el modelo asigne una mayor puntuación de riesgo al cliente que hará default es del 93.5%.
+
+------------------------------------------------------------------------
+
+## Métricas finales
+
+#### Detection Prevalence (16.0%):
+
+Nos indica que el modelo asigna el 16.0% de los datos como default.
+
+------------------------------------------------------------------------
+
+## 10. SHAP
+
+```{r #SHAP prep, echo=TRUE}
+# Extraer el modelo final (Random Forest)
+final_model_rf <- extract_fit_parsnip(final_fit_rf)$fit
+
+# Preprocesar el set de test
+X_test <- bake(prep(rec_rf), new_data = loan_test)
+y_test <- X_test$Current_loan_status
+X_test <- select(X_test, -Current_loan_status)  # remover target
+```
+
+```{r}
+# Función para extraer la probabilidad de "TRUE" (default)
+predict_rf_prob <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "TRUE"]
+}
+```
+
+```{r}
+# Calcular los valores SHAP para cada observación (usa 10 repeticiones por defecto)
+set.seed(123)
+shap_values <- fastshap::explain(
+  object = final_model_rf,
+  X = X_test,
+  pred_wrapper = predict_rf_prob,
+  nsim = 20  # número de permutaciones (aumenta para mayor precisión)
+)
+```
+
+```{r}
+# Lista de variables numéricas
+X_test_long <- X_test |>
+  mutate(row = row_number()) |>
+  mutate(across(-row, as.character)) |>  # <- evita afectar row
+  pivot_longer(-row, names_to = "variable", values_to = "feature_value")
+
+shap_long <- shap_values |>
+  as_tibble() |>
+  mutate(row = row_number()) |>
+  pivot_longer(-row, names_to = "variable", values_to = "shap_value") |>
+  left_join(X_test_long, by = c("row", "variable"))
+```
+
+```{r}
+# Lista de variables numéricas
+vars_numericas <- c("customer_age", "customer_income", "employment_duration",
+                    "loan_amnt", "term_years", "cred_hist_length", "loan_int_rate")
+
+# Filtrar y normalizar feature_value por variable
+shap_num <- shap_long |>
+  filter(variable %in% vars_numericas) |>
+  mutate(feature_value = as.numeric(feature_value)) |>
+  group_by(variable) |>
+  mutate(
+    feature_scaled = (feature_value - min(feature_value, na.rm = TRUE)) /
+                     (max(feature_value, na.rm = TRUE) - min(feature_value, na.rm = TRUE))
+  ) |>
+  ungroup()
+
+# Gráfico con escala por variable
+plot_num <- ggplot(shap_num, aes(
+  x = shap_value,
+  y = reorder(variable, abs(shap_value), FUN = max),
+  color = feature_scaled
+)) +
+  geom_jitter(alpha = 0.6, size = 1.2) +
+  scale_color_viridis_c(option = "plasma", name = "Valor normalizado") +
+  labs(
+    title = "SHAP Summary Plot (Variables Numéricas)",
+    x = "SHAP value",
+    y = "Variable"
+  ) +
+  theme_minimal(base_size = 13) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 0.6)
+
+print(plot_num)
+```
+
+```{r}
+library(scales)  # para hue_pal()
+vars_cat <- c("home_ownership", "loan_intent", "loan_grade", "historical_default")
+
+shap_cat <- shap_long |>
+  filter(variable %in% vars_cat) |>
+  mutate(
+    # Combinar variable + nivel para mejor visualización
+    cat_label = paste(variable, feature_value, sep = ": "),
+    variable = factor(variable, levels = unique(variable))  # mantener orden original
+  )
+
+# Crear paleta con tantos colores como categorías únicas
+n_colors <- length(unique(shap_cat$cat_label))
+color_palette <- hue_pal()(n_colors)  # Paleta automática extendida
+
+# Graficar con paleta manual
+ggplot(shap_cat, aes(
+  x = shap_value,
+  y = cat_label,
+  color = cat_label
+)) +
+  geom_jitter(alpha = 0.6, size = 1.2, width = 0.1) +
+  scale_color_manual(values = color_palette) +
+  labs(
+    title = "SHAP Summary Plot por variable categórica",
+    x = "SHAP value",
+    y = "Categoría",
+    color = "Categoría"
+  ) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 1) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40", linewidth = 0.6)
+```
+
+```{r}
+# Vector de colores personalizados por categoría
+color_palette <- c(
+  "historical_default: False"       = "#FF6699",
+  "historical_default: No Register"= "#660033",
+  "historical_default: True"        = "#CC0000",
+  
+  "home_ownership: MORTGAGE"        = "#660099",
+  "home_ownership: OTHER"           = "#FFFF66",
+  "home_ownership: OWN"             = "#33CCFF",
+  "home_ownership: RENT"            = "#FFCCFF",
+  
+  "loan_grade: A"                   = "#A6CEE3",
+  "loan_grade: B"                   = "#1F78B4",
+  "loan_grade: C"                   = "#B2DF8A",
+  "loan_grade: D"                   = "#33A02C",
+  "loan_grade: E"                   = "#FFFF66",
+  
+  "loan_intent: DEBTCONSOLIDATION" = "#E31A1C",
+  "loan_intent: EDUCATION"         = "#FDBF6F",
+  "loan_intent: HOMEIMPROVEMENT"   = "#33A02C",
+  "loan_intent: MEDICAL"           = "#CAB2D6",
+  "loan_intent: PERSONAL"          = "#660033",
+  "loan_intent: VENTURE"           = "#B15928"
+)
+
+library(ggplot2)
+
+plot_cat <- ggplot(shap_cat, aes(
+  x = shap_value,
+  y = reorder(variable, abs(shap_value), FUN = max),
+  color = cat_label
+)) +
+  geom_jitter(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = color_palette) +
+  labs(
+    title = "SHAP Summary Plot (Variables Categóricas)",
+    x = "SHAP value",
+    y = "Variable",
+    color = "Nivel"
+  ) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 4))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40", linewidth = 0.6)
+
+print(plot_cat)
+```
+
+```{r}
+# Calcular importancia media absoluta de SHAP por variable
+shap_importance <- shap_long %>%
+  group_by(variable) %>%
+  summarise(mean_abs_shap = mean(abs(shap_value))) %>%
+  arrange(desc(mean_abs_shap))
+
+# Gráfico con gradiente de 3 colores (bajo-medio-alto)
+ggplot(shap_importance, aes(x = reorder(variable, mean_abs_shap), y = mean_abs_shap, fill = mean_abs_shap)) +
+  geom_col() +
+  scale_fill_gradientn(
+    colours = c("#d4f0ff", "#1f78b4", "#339933"),
+    values = scales::rescale(c(min(shap_importance$mean_abs_shap),
+                               median(shap_importance$mean_abs_shap),
+                               max(shap_importance$mean_abs_shap))),
+    name = "Importancia"
+  ) +
+  coord_flip() +
+  labs(
+    title = "Importancia global de variables (mean |SHAP|)",
+    x = "Variable",
+    y = "Media de valor absoluto SHAP"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Calcular el percentil 99 de loan_amnt
+p99 <- quantile(shap_num$feature_value[shap_num$variable == "loan_amnt"], 0.99, na.rm = TRUE)
+
+# Filtrar los datos debajo del percentil 99
+shap_loan_amt_filtered <- shap_num %>%
+  filter(variable == "loan_amnt", feature_value < p99)
+
+# Graficar
+ggplot(shap_loan_amt_filtered, aes(x = feature_value, y = shap_value)) +
+  geom_point(alpha = 0.5, size = 1.2, color = "darkblue") +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(
+    title = "Dependencia SHAP - Loan Amount (filtrado al percentil 99)",
+    x = "Loan Amount",
+    y = "SHAP Value"
+  ) +
+  theme_minimal(base_size = 13) +
+  scale_x_continuous(labels = comma)
+```
+
+------------------------------------------------------------------------
