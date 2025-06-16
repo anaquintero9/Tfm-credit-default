@@ -31,6 +31,6 @@ Integración de datos macroeconómicos y automatización de reentrenamiento.
 
 ## Contacto
 ¿Tienes dudas, sugerencias o te gustaría colaborar?
-[Eva Meneses](https://www.linkedin.com/in/evamenesesoto/) - 
-[Regina Meiners](https://www.linkedin.com/in/regmeiners/) - 
-[Ana María Quintero](https://www.linkedin.com/in/anamquintero/)
+[Eva Meneses](https://www.linkedin.com/in/evamenesesoto/)  
+[Regina Meiners](https://www.linkedin.com/in/regmeiners/)   
+[Ana María Quintero](https://www.linkedin.com/in/anamquintero/)  
