@@ -1,8 +1,8 @@
 # Modelos de Machine Learning para la Predicción de Impago en el Sector Financiero
-Trabajo de Fin de Máster (TFM)
-Máster en Big Data & Business Analytics
-EAE Business School – Madrid, 2025
-Autores: Eva Meneses Soto, Ana María Quintero Estévez, María Regina Meiners de Alba
+Trabajo de Fin de Máster (TFM)  
+Máster en Big Data & Business Analytics  
+EAE Business School – Madrid, 2025  
+Autores: Eva Meneses Soto, Ana María Quintero Estévez, María Regina Meiners de Alba  
 
 ## Descripción
 Este repositorio contiene todo el material desarrollado para el Trabajo de Fin de Máster:
