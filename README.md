@@ -10,12 +10,12 @@ Este repositorio contiene todo el material desarrollado para el Trabajo de Fin d
 Nuestro proyecto explora la aplicación de técnicas avanzadas de machine learning para anticipar el riesgo de default en créditos bancarios, combinando análisis estadístico, modelización, interpretabilidad y visualización orientada al negocio.
 
 ## Estructura del repositorio
-/data/         → Dataset utilizado
-/notebooks/    → Colab Notebooks de análisis y preprocesamiento
-/src/          → Scripts de preprocesamiento y entrenamiento
-/reports/      → Documentación y presentaciones (PDF, PPTX)
-/dashboards/   → Dashboards en Power BI y capturas
-/img/          → Gráficos
+/data/         → Dataset utilizado  
+/notebooks/    → Colab Notebooks de análisis y preprocesamiento  
+/src/          → Scripts de preprocesamiento y entrenamiento  
+/reports/      → Documentación y presentaciones (PDF, PPTX)  
+/dashboards/   → Dashboards en Power BI y capturas  
+/img/          → Gráficos  
 
 ## Resumen del proyecto
 ### Objetivo: 
