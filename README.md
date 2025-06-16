@@ -1,4 +1,4 @@
-### Modelos de Machine Learning para la Predicción de Impago en el Sector Financiero
+# Modelos de Machine Learning para la Predicción de Impago en el Sector Financiero
 Trabajo de Fin de Máster (TFM)
 Máster en Big Data & Business Analytics
 EAE Business School – Madrid, 2025
@@ -18,15 +18,15 @@ Nuestro proyecto explora la aplicación de técnicas avanzadas de machine learni
 /img/          → Gráficos
 
 ## Resumen del proyecto
-# Objetivo: 
+### Objetivo: 
 Mejorar la gestión del riesgo crediticio anticipando impagos mediante modelos de machine learning y facilitar la toma de decisiones a través de dashboards explicativos.
-# Metodología: 
+### Metodología: 
 Pipeline de 6 etapas: análisis exploratorio, preprocesamiento, modelado (Ridge, Lasso, Elastic Net, Bagging, Random Forest, KNN, SVM, MARS), evaluación, explicabilidad (SHAP) y despliegue en dashboards.
-# Hallazgos: 
+### Hallazgos: 
 Random Forest fue el modelo más robusto; la interpretabilidad y el monitoreo mediante dashboards son clave para el negocio.
-# Limitaciones: 
+### Limitaciones: 
 Uso de dataset público, ausencia de variables externas.
-# Futuras líneas: 
+### Futuras líneas: 
 Integración de datos macroeconómicos y automatización de reentrenamiento.
 
 ## Contacto
